@@ -21,8 +21,12 @@ context through `CUIEngine::RunScript`; the script reports back through the cons
 Hovering over an item (tooltip) is not detected, only the inspect window. "Opening Case" and "Unboxed" are based on the game's UI code
 and have not been tested with a real case.
 
-**Platform:** Linux (Proton/Wine) with the native Discord client. It talks to Discord's IPC socket
-(`$XDG_RUNTIME_DIR/discord-ipc-0`) through Wine's AF_UNIX support. Windows is not supported.
+**Platform:** Linux (Proton/Wine) and Windows. The plugin connects to Discord through whatever IPC channel it finds, in this order:
+1. Windows named pipe `\\?\pipe\discord-ipc-0..9` (Discord on Windows, arRPC/Vesktop on Windows, `wine-discord-ipc-bridge` under Wine)
+2. Unix socket `discord-ipc-0..9` in `XDG_RUNTIME_DIR`, `TMPDIR`, `TMP`, `TEMP`, `/run/user/<uid>` and `/tmp`, including the Flatpak
+   (Discord, Canary, Vesktop, WebCord) and Snap (Discord, Canary) sub-folders. Under Wine it reaches them through the `Z:` drive.
+
+The Linux/Proton path with the native Discord client is the tested one; the Windows named-pipe path has not been tested yet.
 
 ## Install
 
@@ -43,8 +47,8 @@ For development, `bin/rpc_script.js` replaces the built-in script and is re-run 
 
 The plugin writes a log to `<game folder>/bin/DiscordRPC.log` (connection, game state, every presence update).
 
-- *No presence at all*: look for `discord: connected via` in the log. If it is missing, Discord's socket is not reachable from the
-  Proton container (Flatpak/Snap Discord may need its socket exposed).
+- *No presence at all*: look for `discord: connected via` in the log. If it is missing, Discord's pipe/socket is not reachable
+  (under Proton, a Flatpak/Snap Discord may need its socket exposed to the container).
 - *No images*: images are loaded from this repository (`assets/`) through direct URLs. Check the log for the `SET_ACTIVITY` line.
 - *No score*: the log shows the netvar/team scan result. An offset that doesn't match your game build makes it fall back to "In game".
 - If the launcher verifies game files and restores `mss32.dll`, install it again.

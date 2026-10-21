@@ -12,6 +12,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <algorithm>
 #include <cstring>
 #include <ctime>
 #include <string>
@@ -663,31 +664,39 @@ struct SockAddrUn {
 
 class DiscordIpc {
 public:
-    bool Connected() const { return s_ != INVALID_SOCKET; }
+    bool Connected() const { return s_ != INVALID_SOCKET || pipe_ != INVALID_HANDLE_VALUE; }
 
     void Close() {
         if (s_ != INVALID_SOCKET) closesocket(s_);
         s_ = INVALID_SOCKET;
+        if (pipe_ != INVALID_HANDLE_VALUE) CloseHandle(pipe_);
+        pipe_ = INVALID_HANDLE_VALUE;
     }
 
+    // Verbindungswege, in dieser Reihenfolge:
+    //  1. Windows Named Pipe \\?\pipe\discord-ipc-N (Discord unter Windows, arRPC/Vesktop unter Windows,
+    //     wine-discord-ipc-bridge unter Wine)
+    //  2. Unix-Socket discord-ipc-N in den ueblichen Laufzeitverzeichnissen (Native, Flatpak, Snap, Vesktop/Canary),
+    //     unter Wine ueber Z:\ erreichbar
     bool Connect() {
-        std::string bases[2];
-        char env[MAX_PATH] = {};
-        if (GetEnvironmentVariableA("XDG_RUNTIME_DIR", env, sizeof env)) bases[0] = env;
-        bases[1] = "/run/user/1000";
-        static const char* subdirs[] = {"", "/app/com.discordapp.Discord", "/snap.discord"};
-        for (const auto& base : bases) {
-            if (base.empty()) continue;
+        for (int n = 0; n < 10; ++n) {
+            std::string pipe = "\\\\?\\pipe\\discord-ipc-" + std::to_string(n);
+            if (TryPipe(pipe) && FinishConnect("pipe " + pipe)) return true;
+        }
+        static const char* subdirs[] = {"",
+                                        "/app/com.discordapp.Discord",
+                                        "/app/com.discordapp.DiscordCanary",
+                                        "/app/dev.vencord.Vesktop",
+                                        "/app/io.github.spacingbat3.webcord",
+                                        "/snap.discord",
+                                        "/snap.discord-canary"};
+        for (const auto& base : SocketBases()) {
             for (const char* sub : subdirs) {
                 for (int n = 0; n < 10; ++n) {
                     std::string unixPath = base + sub + "/discord-ipc-" + std::to_string(n);
                     std::string winPath = "Z:" + unixPath;
-                    for (char& c : winPath) if (c == '/') c = '\\';
-                    if (TryConnect(winPath) || TryConnect(unixPath)) {
-                        Log("discord: connected via %s", unixPath.c_str());
-                        if (Handshake()) return true;
-                        Close();
-                    }
+                    for (char& ch : winPath) if (ch == '/') ch = '\\';
+                    if ((TryConnect(winPath) || TryConnect(unixPath)) && FinishConnect("socket " + unixPath)) return true;
                 }
             }
         }
@@ -724,8 +733,8 @@ public:
     // Eingehende Frames abholen (Antworten, Ping).
     void Pump() {
         while (Connected()) {
-            u_long avail = 0;
-            if (ioctlsocket(s_, FIONREAD, &avail) != 0 || avail < 8) return;
+            DWORD avail = 0;
+            if (!Available(avail) || avail < 8) return;
             uint32_t op = 0;
             std::string payload;
             if (!RecvFrame(op, payload)) {
@@ -740,8 +749,60 @@ public:
 
 private:
     SOCKET s_ = INVALID_SOCKET;
+    HANDLE pipe_ = INVALID_HANDLE_VALUE;
     int nonce_ = 0;
     int lastErr_ = 0;
+
+    bool FinishConnect(const std::string& what) {
+        Log("discord: connected via %s", what.c_str());
+        if (Handshake()) return true;
+        Close();
+        return false;
+    }
+
+    // Verzeichnisse, in denen Unix-Sockets liegen koennen. Unter Wine wird die Linux-UID aus /proc gelesen.
+    static std::vector<std::string> SocketBases() {
+        std::vector<std::string> out;
+        auto add = [&](std::string s) {
+            while (s.size() > 1 && (s.back() == '/' || s.back() == '\\')) s.pop_back();
+            for (char& ch : s) if (ch == '\\') ch = '/';
+            if (s.size() > 1 && s[0] == '/' && std::find(out.begin(), out.end(), s) == out.end()) out.push_back(s);
+        };
+        for (const char* name : {"XDG_RUNTIME_DIR", "TMPDIR", "TMP", "TEMP", "TEMPDIR"}) {
+            char env[MAX_PATH] = {};
+            if (GetEnvironmentVariableA(name, env, sizeof env)) add(env);
+        }
+        if (FILE* f = fopen("Z:\\proc\\self\\status", "r")) {  // nur unter Wine vorhanden
+            char line[256];
+            while (fgets(line, sizeof line, f)) {
+                unsigned uid;
+                if (sscanf(line, "Uid: %u", &uid) == 1) add("/run/user/" + std::to_string(uid));
+            }
+            fclose(f);
+        }
+        add("/run/user/1000");
+        add("/tmp");
+        return out;
+    }
+
+    bool Available(DWORD& avail) {
+        avail = 0;
+        if (pipe_ != INVALID_HANDLE_VALUE) return PeekNamedPipe(pipe_, nullptr, 0, nullptr, &avail, nullptr) != 0;
+        u_long n = 0;
+        if (ioctlsocket(s_, FIONREAD, &n) != 0) return false;
+        avail = n;
+        return true;
+    }
+
+    bool TryPipe(const std::string& path) {
+        HANDLE h = CreateFileA(path.c_str(), GENERIC_READ | GENERIC_WRITE, 0, nullptr, OPEN_EXISTING, 0, nullptr);
+        if (h == INVALID_HANDLE_VALUE) {
+            lastErr_ = static_cast<int>(GetLastError());
+            return false;
+        }
+        pipe_ = h;
+        return true;
+    }
 
     bool TryConnect(const std::string& path) {
         SOCKET t = socket(1 /*AF_UNIX*/, SOCK_STREAM, 0);
@@ -774,7 +835,13 @@ private:
 
     bool SendAll(const char* d, size_t n) {
         while (n) {
-            int r = send(s_, d, static_cast<int>(n), 0);
+            int r;
+            if (pipe_ != INVALID_HANDLE_VALUE) {
+                DWORD w = 0;
+                r = WriteFile(pipe_, d, static_cast<DWORD>(n), &w, nullptr) ? static_cast<int>(w) : -1;
+            } else {
+                r = send(s_, d, static_cast<int>(n), 0);
+            }
             if (r <= 0) return false;
             d += r;
             n -= static_cast<size_t>(r);
@@ -783,8 +850,23 @@ private:
     }
 
     bool RecvAll(char* d, size_t n) {
+        DWORD waited = 0;
         while (n) {
-            int r = recv(s_, d, static_cast<int>(n), 0);
+            int r;
+            if (pipe_ != INVALID_HANDLE_VALUE) {  // Pipes kennen kein Receive-Timeout: pollen
+                DWORD avail = 0;
+                if (!PeekNamedPipe(pipe_, nullptr, 0, nullptr, &avail, nullptr)) return false;
+                if (!avail) {
+                    if (waited >= 2000) return false;
+                    Sleep(5);
+                    waited += 5;
+                    continue;
+                }
+                DWORD got = 0;
+                r = ReadFile(pipe_, d, static_cast<DWORD>(n < avail ? n : avail), &got, nullptr) ? static_cast<int>(got) : -1;
+            } else {
+                r = recv(s_, d, static_cast<int>(n), 0);
+            }
             if (r <= 0) return false;
             d += r;
             n -= static_cast<size_t>(r);
