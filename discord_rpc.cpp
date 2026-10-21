@@ -15,6 +15,7 @@
 #include <cstring>
 #include <ctime>
 #include <string>
+#include <vector>
 
 #include "assets_keys.h"
 
@@ -315,6 +316,243 @@ static std::string AssetUrl(const std::string& key) {
 
 static const char* kProjectName = "CS:GO Supremacy";
 
+// ---------------------------------------------------------------------------------------------
+// Panorama-Bridge: ein JS wird einmal per CUIEngine::RunScript injiziert und laeuft danach selbst
+// (ueber $.Schedule, also im UI-Thread). Es meldet den Menuezustand per $.Msg in eine Konsolen-Logdatei,
+// die hier eingelesen wird. Index/Signatur stammen aus der Analyse von panorama.dll (Build 2023).
+
+typedef bool(__thiscall* IsValidPanelFn)(void*, void*);
+typedef void(__thiscall* RunScriptFn)(void*, void*, const char*, const char*, uint64_t, int, bool);
+
+constexpr int kVtAccessUiEngine = 11;     // IPanoramaUIEngine::AccessUIEngine
+constexpr int kVtIsValidPanel = 36;       // IUIEngine::IsValidPanelPointer
+constexpr int kVtRunScript = 113;         // IUIEngine::RunScript
+constexpr uintptr_t kRunScriptRva = 0x4BC20;  // zur Validierung des Vtable-Eintrags
+
+#include "bridge_js.h"  // kBridgeScript, erzeugt aus bridge.js
+
+struct PanoramaBridge {
+    uintptr_t engine = 0;
+    bool disabled = false;
+    DWORD lastInject = 0;
+    DWORD lastHeartbeat = 0;
+    FILETIME scriptTime = {};  // Entwickler-Hot-Reload: bin/rpc_script.js
+    std::string tab;        // zuletzt gemeldete Menueseite
+    std::string mode;       // none | inspect | crate | opening
+    std::string name, type, wear, flt;  // Item bzw. Kiste
+    bool recent = false;    // frisch aus einer Kiste gezogen
+    // Logdatei
+    std::string logPath;
+    uint64_t logOffset = 0;
+};
+static PanoramaBridge g_pano;
+
+static bool PanoramaInit() {
+    HMODULE pm = GetModuleHandleA("panorama.dll");
+    if (!pm) return false;
+    auto createInterface = reinterpret_cast<CreateInterfaceFn>(GetProcAddress(pm, "CreateInterface"));
+    void* pui = createInterface ? createInterface("PanoramaUIEngine001", nullptr) : nullptr;
+    if (!pui) return false;
+    uintptr_t fn = Rd<uintptr_t>(Rd<uintptr_t>(reinterpret_cast<uintptr_t>(pui)) + 4 * kVtAccessUiEngine);
+    if (!fn) return false;
+    uintptr_t engine = reinterpret_cast<ThisCallFn>(fn)(pui);
+    uintptr_t runScript = engine ? Rd<uintptr_t>(Rd<uintptr_t>(engine) + 4 * kVtRunScript) : 0;
+    if (runScript != reinterpret_cast<uintptr_t>(pm) + kRunScriptRva) {
+        Log("panorama: RunScript entry %p does not match the expected function - bridge disabled",
+            reinterpret_cast<void*>(runScript));
+        g_pano.disabled = true;
+        return false;
+    }
+    g_pano.engine = engine;
+    Log("panorama: UIEngine=%p RunScript ok", reinterpret_cast<void*>(engine));
+    return true;
+}
+
+// Alle gueltigen Panels: IsValidPanelPointer durchsucht einen Rot-Schwarz-Baum (Knoten 24 Byte, links@0, rechts@4,
+// Panel-Zeiger@0x10); Elemente @engine+0xF0, Wurzel @engine+0xFC.
+static std::vector<uintptr_t> PanoramaPanels() {
+    std::vector<uintptr_t> out;
+    uintptr_t nodes = Rd<uintptr_t>(g_pano.engine + 0xF0);
+    int root = Rd<int>(g_pano.engine + 0xFC, -1);
+    if (!nodes || root == -1) return out;
+    std::vector<int> stack{root};
+    while (!stack.empty() && out.size() < 20000) {
+        int n = stack.back();
+        stack.pop_back();
+        if (n == -1) continue;
+        uintptr_t node = nodes + static_cast<uintptr_t>(n) * 24;
+        uintptr_t key = Rd<uintptr_t>(node + 0x10);
+        if (!key) continue;
+        out.push_back(key);
+        stack.push_back(Rd<int>(node, -1));
+        stack.push_back(Rd<int>(node + 4, -1));
+    }
+    return out;
+}
+
+static int g_panelAttempt = 0;
+
+static bool PanoramaInject(const char* script) {
+    uintptr_t vt = Rd<uintptr_t>(g_pano.engine);
+    auto isValid = reinterpret_cast<IsValidPanelFn>(Rd<uintptr_t>(vt + 4 * kVtIsValidPanel));
+    auto runScript = reinterpret_cast<RunScriptFn>(Rd<uintptr_t>(vt + 4 * kVtRunScript));
+    void* eng = reinterpret_cast<void*>(g_pano.engine);
+
+    std::vector<uintptr_t> panels = PanoramaPanels();
+    if (panels.empty()) {
+        Log("panorama: no panels found");
+        return false;
+    }
+    // Panel mit der ID "MainMenu" suchen: Offset des ID-Strings im Panel ist unbekannt, daher wird gescannt.
+    uintptr_t target = 0;
+    int idOffset = -1;
+    for (uintptr_t p : panels) {
+        for (int off = 0x10; off < 0x400 && !target; off += 4) {
+            uintptr_t s = Rd<uintptr_t>(p + off);
+            if (s > 0x10000 && RdStr(s, 9) == "MainMenu" && RdStr(s, 10) == "MainMenu") {
+                target = p;
+                idOffset = off;
+            }
+        }
+        if (target) break;
+    }
+    if (target) {
+        Log("panorama: %zu panels, 'MainMenu' at %p (id offset 0x%X)", panels.size(), reinterpret_cast<void*>(target), idOffset);
+    } else {
+        target = panels[static_cast<size_t>(g_panelAttempt++) % panels.size()];
+        Log("panorama: %zu panels, 'MainMenu' not found, trying %p", panels.size(), reinterpret_cast<void*>(target));
+    }
+    if (!isValid(eng, reinterpret_cast<void*>(target))) {
+        Log("panorama: panel %p invalid", reinterpret_cast<void*>(target));
+        return false;
+    }
+    runScript(eng, reinterpret_cast<void*>(target), script, "panorama/layout/base.xml", 8, 10, false);
+    Log("panorama: script executed");
+    return true;
+}
+
+static std::string UrlDecode(const std::string& s) {
+    std::string o;
+    for (size_t i = 0; i < s.size(); ++i) {
+        if (s[i] == '%' && i + 2 < s.size() + 0 && isxdigit(static_cast<unsigned char>(s[i + 1])) && isxdigit(static_cast<unsigned char>(s[i + 2]))) {
+            o += static_cast<char>(strtol(s.substr(i + 1, 2).c_str(), nullptr, 16));
+            i += 2;
+        } else {
+            o += s[i];
+        }
+    }
+    return o;
+}
+
+// Neue Zeilen aus der Konsolen-Logdatei lesen; "RPC|<gen>|key=value"-Zeilen auswerten.
+static void PanoramaReadLog() {
+    HANDLE f = CreateFileA(g_pano.logPath.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr,
+                           OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (f == INVALID_HANDLE_VALUE) return;
+    LARGE_INTEGER size;
+    GetFileSizeEx(f, &size);
+    if (static_cast<uint64_t>(size.QuadPart) < g_pano.logOffset) g_pano.logOffset = 0;  // Datei wurde neu angelegt
+    uint64_t want = static_cast<uint64_t>(size.QuadPart) - g_pano.logOffset;
+    if (want > 65536) {  // grosse Rueckstaende ueberspringen
+        g_pano.logOffset = static_cast<uint64_t>(size.QuadPart) - 65536;
+        want = 65536;
+    }
+    if (want) {
+        std::string buf(static_cast<size_t>(want), '\0');
+        LARGE_INTEGER pos;
+        pos.QuadPart = static_cast<LONGLONG>(g_pano.logOffset);
+        SetFilePointerEx(f, pos, nullptr, FILE_BEGIN);
+        DWORD got = 0;
+        ReadFile(f, &buf[0], static_cast<DWORD>(want), &got, nullptr);
+        buf.resize(got);
+        size_t used = buf.rfind('\n');
+        if (used == std::string::npos) {
+            buf.clear();  // keine vollstaendige Zeile
+        } else {
+            g_pano.logOffset += used + 1;
+            buf.resize(used);
+        }
+        size_t p = 0;
+        while (p < buf.size()) {
+            size_t e = buf.find('\n', p);
+            if (e == std::string::npos) e = buf.size();
+            std::string line = buf.substr(p, e - p);
+            p = e + 1;
+            size_t at = line.find("RPC|");
+            if (at == std::string::npos) continue;
+            while (!line.empty() && (line.back() == '\r' || line.back() == ' ')) line.pop_back();
+            g_pano.lastHeartbeat = GetTickCount();
+            if (line.compare(line.size() >= 3 ? line.size() - 3 : 0, 3, "|hb") == 0) continue;
+            // Felder "key=value" getrennt durch '|', Werte URL-kodiert
+            std::string tab = g_pano.tab, mode = "none", name, type, wear, flt;
+            bool recent = false;
+            size_t pos = line.find('|', at + 4);  // hinter "RPC|<gen>"
+            while (pos != std::string::npos) {
+                size_t next = line.find('|', pos + 1);
+                std::string kv = line.substr(pos + 1, next == std::string::npos ? std::string::npos : next - pos - 1);
+                size_t eq = kv.find('=');
+                if (eq != std::string::npos) {
+                    std::string k = kv.substr(0, eq), v = UrlDecode(kv.substr(eq + 1));
+                    while (!v.empty() && (v.back() == '\r' || v.back() == ' ')) v.pop_back();
+                    if (k == "tab") tab = v;
+                    else if (k == "mode") mode = v;
+                    else if (k == "name") name = v;
+                    else if (k == "type") type = v;
+                    else if (k == "wear") wear = v;
+                    else if (k == "float") flt = v;
+                    else if (k == "recent") recent = v == "1";
+                }
+                pos = next;
+            }
+            if (tab != g_pano.tab || mode != g_pano.mode || name != g_pano.name)
+                Log("panorama: tab='%s' mode=%s name='%s' type='%s' wear='%s' float=%s recent=%d", tab.c_str(), mode.c_str(),
+                    name.c_str(), type.c_str(), wear.c_str(), flt.c_str(), recent);
+            g_pano.tab = tab;
+            g_pano.mode = mode;
+            g_pano.name = name;
+            g_pano.type = type;
+            g_pano.wear = wear;
+            g_pano.flt = flt;
+            g_pano.recent = recent;
+        }
+    }
+    CloseHandle(f);
+}
+
+static void PanoramaTick() {
+    if (g_pano.disabled) return;
+    if (!g_pano.engine && !PanoramaInit()) return;
+    PanoramaReadLog();
+    DWORD now = GetTickCount();
+    // bin/rpc_script.js ersetzt das eingebaute Script und wird bei jeder Aenderung neu ausgefuehrt.
+    char path[MAX_PATH];
+    snprintf(path, sizeof path, "%s\\rpc_script.js", g_dir);
+    std::string custom;
+    WIN32_FILE_ATTRIBUTE_DATA attr;
+    if (GetFileAttributesExA(path, GetFileExInfoStandard, &attr)) {
+        HANDLE f = CreateFileA(path, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, OPEN_EXISTING, 0, nullptr);
+        if (f != INVALID_HANDLE_VALUE) {
+            char buf[4096];
+            DWORD got = 0;
+            while (ReadFile(f, buf, sizeof buf, &got, nullptr) && got) custom.append(buf, got);
+            CloseHandle(f);
+        }
+        if (!custom.empty() && CompareFileTime(&attr.ftLastWriteTime, &g_pano.scriptTime) != 0) {
+            if (!g_pano.lastInject || now - g_pano.lastInject > 3000) {
+                g_pano.lastInject = now;
+                Log("panorama: loading rpc_script.js (%zu bytes)", custom.size());
+                if (PanoramaInject(custom.c_str())) g_pano.scriptTime = attr.ftLastWriteTime;  // sonst spaeter erneut versuchen
+            }
+            return;
+        }
+    }
+    bool stale = !g_pano.lastHeartbeat || now - g_pano.lastHeartbeat > 6000;
+    if (stale && custom.empty() && (!g_pano.lastInject || now - g_pano.lastInject > 8000)) {
+        g_pano.lastInject = now;
+        PanoramaInject(kBridgeScript);
+    }
+}
+
 static time_t g_sessionStart = 0;
 static time_t g_matchStart = 0;
 static std::string g_matchMap;
@@ -377,8 +615,22 @@ static Presence BuildPresence() {
         p.largeText = kProjectName;
         return p;
     }
-    p.details = "In Main Menu";
     p.start = g_sessionStart;
+    bool live = g_pano.lastHeartbeat && GetTickCount() - g_pano.lastHeartbeat < 6000;
+    if (live && g_pano.mode == "opening") {
+        p.details = "Opening Case";
+        p.state = g_pano.name;
+    } else if (live && g_pano.mode == "crate") {
+        p.details = "Viewing Case";
+        p.state = g_pano.name;
+    } else if (live && g_pano.mode == "inspect") {
+        p.details = (g_pano.recent ? "Unboxed: " : "Inspecting: ") + g_pano.name;
+        p.state = g_pano.flt.empty() ? g_pano.type : g_pano.wear + " - Float " + g_pano.flt;
+    } else if (live && g_pano.tab == "JsInventory") {
+        p.details = "Browsing Inventory";
+    } else {
+        p.details = "In Main Menu";
+    }
     p.largeImage = AssetUrl("logo");
     p.largeText = kProjectName;
     return p;
@@ -432,7 +684,7 @@ public:
                     std::string winPath = "Z:" + unixPath;
                     for (char& c : winPath) if (c == '/') c = '\\';
                     if (TryConnect(winPath) || TryConnect(unixPath)) {
-                        Log("discord: verbunden ueber %s", unixPath.c_str());
+                        Log("discord: connected via %s", unixPath.c_str());
                         if (Handshake()) return true;
                         Close();
                     }
@@ -566,6 +818,19 @@ static DWORD WINAPI Worker(LPVOID) {
     WSADATA wsa;
     WSAStartup(MAKEWORD(2, 2), &wsa);
     g_sessionStart = time(nullptr);
+    {
+        char exe[MAX_PATH];
+        GetModuleFileNameA(nullptr, exe, sizeof exe);
+        *strrchr(exe, '\\') = 0;
+        g_pano.logPath = std::string(exe) + "\\csgo\\rpc_console.log";
+        char flag[MAX_PATH];
+        snprintf(flag, sizeof flag, "%s\\rpc_nopanorama.txt", g_dir);
+        if (GetFileAttributesA(flag) != INVALID_FILE_ATTRIBUTES) {
+            g_pano.disabled = true;
+            Log("panorama: disabled by rpc_nopanorama.txt");
+        }
+        DeleteFileA(g_pano.logPath.c_str());
+    }
 
     while (!(g_client = reinterpret_cast<uintptr_t>(GetModuleHandleA("client.dll"))) ||
            !(g_engine = reinterpret_cast<uintptr_t>(GetModuleHandleA("engine.dll"))) ||
@@ -582,6 +847,7 @@ static DWORD WINAPI Worker(LPVOID) {
 
     for (;; Sleep(1000)) {
         if (!g_cvar) InitCvar();
+        PanoramaTick();
         Presence now = BuildPresence();
 
         if (!discord.Connected()) {
@@ -589,7 +855,7 @@ static DWORD WINAPI Worker(LPVOID) {
             if (lastConnect && t - lastConnect < 5000) continue;
             lastConnect = t;
             if (!discord.Connect()) {
-                Log("discord: keine Verbindung (WSA-Fehler %d)", WSAGetLastError());
+                Log("discord: no connection (WSA error %d)", WSAGetLastError());
                 continue;
             }
             haveLast = false;

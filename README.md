@@ -5,13 +5,21 @@ A small in-process plugin that shows your CS:GO Legacy (Supremacy) status on Dis
 | State | Shown |
 |-------|-------|
 | Main menu | "In Main Menu" + project logo |
+| Inventory | "Browsing Inventory" |
+| Inspecting an item | `Inspecting: <item name>` and `<condition> - Float <value>` (items without a float show their type) |
+| Viewing / opening a case | "Viewing Case" / "Opening Case" with the case name |
+| Unboxed item | `Unboxed: <item name>` with condition and float |
 | Loading | "Loading map" + map name |
 | In a match | `<Game mode> - <map>`, score (`CT 7 : 5 T`), match timer, map screenshot as the large image, your team as the small image |
 | Spectating | same as above, the small image is an eye icon ("Spectating") |
 
 Everything is read directly from the game process using the public 2023 Windows CS:GO offsets
 ([hazedumper](https://github.com/frk1/hazedumper)); team scores and game mode come from the game's own netvar and ConVar tables.
-Inventory detection is not implemented (the inventory shows as "In Main Menu").
+
+Menu, inventory, item and case states come from Panorama (the game's UI): the DLL runs a small script (`bridge.js`) in the main menu
+context through `CUIEngine::RunScript`; the script reports back through the console log (`csgo/rpc_console.log`).
+Hovering over an item (tooltip) is not detected, only the inspect window. "Opening Case" and "Unboxed" are based on the game's UI code
+and have not been tested with a real case.
 
 **Platform:** Linux (Proton/Wine) with the native Discord client. It talks to Discord's IPC socket
 (`$XDG_RUNTIME_DIR/discord-ipc-0`) through Wine's AF_UNIX support. Windows is not supported.
@@ -30,9 +38,12 @@ To uninstall, delete `mss32.dll` and rename `mss32_orig.dll` back to `mss32.dll`
 
 ## Troubleshooting
 
+To switch the Panorama part off (menu/inventory states), create an empty file `<game folder>/bin/rpc_nopanorama.txt`.
+For development, `bin/rpc_script.js` replaces the built-in script and is re-run whenever it changes (copy `bridge.js` there to start).
+
 The plugin writes a log to `<game folder>/bin/DiscordRPC.log` (connection, game state, every presence update).
 
-- *No presence at all*: look for `discord: verbunden` in the log. If it is missing, Discord's socket is not reachable from the
+- *No presence at all*: look for `discord: connected via` in the log. If it is missing, Discord's socket is not reachable from the
   Proton container (Flatpak/Snap Discord may need its socket exposed).
 - *No images*: images are loaded from this repository (`assets/`) through direct URLs. Check the log for the `SET_ACTIVITY` line.
 - *No score*: the log shows the netvar/team scan result. An offset that doesn't match your game build makes it fall back to "In game".

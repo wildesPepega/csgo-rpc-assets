@@ -2,3 +2,4 @@ mss32.dll
 mss32.def
 rel/
 *.zip
+bridge_js.h
