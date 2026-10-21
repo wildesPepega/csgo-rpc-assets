@@ -11,7 +11,7 @@ A small in-process plugin that shows your CS:GO Legacy (Supremacy) status on Dis
 | Unboxed item | `Unboxed: <item name>` with condition and float |
 | Loading | "Loading map" + map name |
 | In a match | `<Game mode> - <map>`, score (`CT 7 : 5 T`), match timer, map screenshot as the large image, your team as the small image |
-| Spectating | same as above, the small image is an eye icon ("Spectating") |
+| Spectating | same as above, the small image is an eye icon ("Spectating"); only for real spectators, dead players keep their team icon |
 
 Everything is read directly from the game process using the public 2023 Windows CS:GO offsets
 ([hazedumper](https://github.com/frk1/hazedumper)); team scores and game mode come from the game's own netvar and ConVar tables.

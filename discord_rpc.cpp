@@ -28,11 +28,11 @@ namespace off {
 constexpr uintptr_t dwClientState = 0x59F19C;
 constexpr uintptr_t clientState_State = 0x108;          // dwClientState_State (SignonState)
 constexpr uintptr_t clientState_Map = 0x28C;            // dwClientState_Map (char[])
+constexpr uintptr_t clientState_LocalPlayer = 0x180;    // dwClientState_GetLocalPlayer
 // client.dll
 constexpr uintptr_t dwEntityList = 0x4E0102C;
 constexpr uintptr_t dwLocalPlayer = 0xDEB99C;
 constexpr uintptr_t m_iTeamNum = 0xF4;  // netvar, hazedumper
-constexpr uintptr_t m_iObserverMode = 0x3388;
 }  // namespace off
 
 constexpr int kSignonFull = 6;
@@ -289,19 +289,25 @@ static bool ReadScores(int& t, int& ct) {
     return t >= 0 && ct >= 0 && t < 100 && ct < 100;
 }
 
-// Spectator (Team 1) oder tot und einem Spieler zuschauend (Fixed/In-Eye/Chase/Roaming).
-static bool IsSpectating() {
-    uintptr_t local = Rd<uintptr_t>(g_client + off::dwLocalPlayer);
-    if (!local) return false;
-    int team = Rd<int>(local + off::m_iTeamNum, 0);
-    int mode = Rd<int>(local + off::m_iObserverMode, 0);
-    return team == 1 || (mode >= 3 && mode <= 6);
+// Team des lokalen Spielers: 1 = Spectator, 2 = T, 3 = CT, 0 = unbekannt/keins.
+// Quelle 1: client.dll!dwLocalPlayer. Beim Beitritt (noch nicht gespawnt) ist der Zeiger oft leer; dann wird die Entity
+// ueber den Spielerindex aus dem ClientState nachgeschlagen. Tote Spieler behalten ihr Team (m_iTeamNum bleibt 2/3).
+static int ReadTeam(uintptr_t ent) {
+    int t = ent ? Rd<int>(ent + off::m_iTeamNum, 0) : 0;
+    return t >= 1 && t <= 3 ? t : 0;
 }
 
 static int LocalTeam() {
-    uintptr_t local = Rd<uintptr_t>(g_client + off::dwLocalPlayer);
-    return local ? Rd<int>(local + off::m_iTeamNum, 0) : 0;
+    int team = ReadTeam(Rd<uintptr_t>(g_client + off::dwLocalPlayer));
+    if (!team) {
+        uintptr_t cs = Rd<uintptr_t>(g_engine + off::dwClientState);
+        int idx = cs ? Rd<int>(cs + off::clientState_LocalPlayer, -1) : -1;
+        if (idx >= 0) team = ReadTeam(EntityByIndex(idx + 1));
+    }
+    return team;
 }
+
+static int g_cachedTeam = 0;  // letztes bekanntes Team (T/CT) in dieser Map, ueberbrueckt kurze Luecken
 
 // Nur Bilder, die im Assets-Repo liegen; sonst gaebe Discord ein leeres Bild aus.
 static const char* kAssetBaseUrl = "https://raw.githubusercontent.com/wildesPepega/csgo-rpc-assets/main/assets/";
@@ -577,6 +583,7 @@ static Presence BuildPresence() {
         if (map != g_matchMap) {
             g_matchMap = map;
             g_matchStart = time(nullptr);
+            g_cachedTeam = 0;
             ResetTeams();
         }
         if (!g_nv.ready) ResolveNetvars();
@@ -596,12 +603,20 @@ static Presence BuildPresence() {
         if (p.largeImage.empty()) p.largeImage = AssetUrl("logo");
         p.largeText = map;
         int team = LocalTeam();
-        if (IsSpectating()) {
+        if (team == 2 || team == 3) g_cachedTeam = team;
+        bool spectator = team == 1;  // nur echte Zuschauer; tote Spieler mit Team behalten ihr Team-Icon
+        int shown = spectator ? 0 : (team ? team : g_cachedTeam);
+        static int lastLogged = -1;
+        if (team != lastLogged) {
+            Log("team: local=%d cached=%d shown=%d spectator=%d", team, g_cachedTeam, shown, spectator);
+            lastLogged = team;
+        }
+        if (spectator) {
             p.smallImage = AssetUrl("spectator");
             p.smallText = "Spectating";
-        } else if (team == 2 || team == 3) {
-            p.smallImage = AssetUrl(team == 3 ? "ct" : "t");
-            p.smallText = team == 3 ? "Counter-Terrorists" : "Terrorists";
+        } else if (shown == 2 || shown == 3) {
+            p.smallImage = AssetUrl(shown == 3 ? "ct" : "t");
+            p.smallText = shown == 3 ? "Counter-Terrorists" : "Terrorists";
         } else {
             p.smallImage = AssetUrl("logo");
             p.smallText = kProjectName;
